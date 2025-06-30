@@ -264,87 +264,61 @@ def bearing_from(lat1, lon1, lat2, lon2):
     bearing = math.degrees(math.atan2(x, y))
     return (bearing + 360) % 360
 
-def interpolate_within_layer(poly, vel_df, resolution=[700,50], smooth=10):
-    
+def interpolate_layer(poly, vel_df, resolution=[700, 200], smooth=15, threshold=3,
+                      polygon_above=None, polygon_below=None, x_bounds=(50, 300)):
+    # from matplotlib.path import Path
+    # from scipy.interpolate import griddata
+    # from scipy.ndimage import gaussian_filter
+
     path = Path(poly)
     in_layer = path.contains_points(vel_df[['x', 'y']].values)
     vel_in_layer = vel_df[in_layer]
-    
-    # Local bounding box grid for interpolation
-    min_x, max_x = np.min([p[0] for p in poly]), np.max([p[0] for p in poly])
-    min_y, max_y = np.min([p[1] for p in poly]), np.max([p[1] for p in poly])
 
-    xi_local = np.linspace(min_x, max_x, resolution[0])
-    yi_local = np.linspace(min_y, max_y, resolution[1])
-    
-    X_layer, Y_layer = np.meshgrid(xi_local, yi_local)
-
-    V_model = griddata(
-    (vel_in_layer['x'], vel_in_layer['y']),
-    vel_in_layer['velocity'],
-    (X_layer, Y_layer),
-    method='nearest',
-    )
-
-    points = np.vstack((X_layer.ravel(), Y_layer.ravel())).T
-    inside = path.contains_points(points).reshape(X_layer.shape)
-    V_smooth = gaussian_filter(V_model, sigma=smooth)
-    V_masked = np.ma.array(V_smooth, mask=~inside)
-    
-    return X_layer, Y_layer, V_masked
-
-def interpolate_transition_layer(poly, polygon_above, polygon_below, vel_df, resolution=[700,50], x_bounds=(50, 300)):
-    # Create full horizontal grid (0–400 km) and local vertical range
+    # Define grid bounds
+    min_x = np.min([p[0] for p in poly]) if x_bounds is None else x_bounds[0]
+    max_x = np.max([p[0] for p in poly]) if x_bounds is None else x_bounds[1]
     min_y = np.min([p[1] for p in poly])
     max_y = np.max([p[1] for p in poly])
-    min_x, max_x = x_bounds
 
     xi = np.linspace(min_x, max_x, resolution[0])
     yi = np.linspace(min_y, max_y, resolution[1])
     X, Y = np.meshgrid(xi, yi)
 
-    # Create mask from polygon
-    path = Path(poly)
-    XY = np.vstack((X.ravel(), Y.ravel())).T
-    inside_mask = path.contains_points(XY).reshape(X.shape)
-
-    # Extract velocity points for above and below
-    coords = vel_df[['x', 'y']].values
-    v_above = vel_df[Path(polygon_above).contains_points(coords)]
-    v_below = vel_df[Path(polygon_below).contains_points(coords)]
-
-    if v_above.empty or v_below.empty:
-        raise ValueError("Missing velocity points in layers above or below")
-
-    tree_above = cKDTree(v_above[['x', 'y']])
-    tree_below = cKDTree(v_below[['x', 'y']])
+    points = np.vstack((X.ravel(), Y.ravel())).T
+    inside = path.contains_points(points).reshape(X.shape)
 
     V_interp = np.full_like(X, np.nan, dtype=float)
 
-    for i in range(X.shape[0]):
-        for j in range(X.shape[1]):
-            if not inside_mask[i, j]:
-                continue
+    if len(vel_in_layer) >= threshold:
+        # Enough points for proper interpolation
+        V_raw = griddata(
+            (vel_in_layer['x'], vel_in_layer['y']),
+            vel_in_layer['velocity'],
+            (X, Y),
+            method='nearest',
+        )
+        V_smooth = gaussian_filter(V_raw, sigma=smooth)
+        V_interp[inside] = V_smooth[inside]
 
-            x, y = X[i, j], Y[i, j]
+    else:
+        # Transition layer: average between above and below
+        if polygon_above is None or polygon_below is None:
+            raise ValueError("Missing polygons above or below for transition layer.")
 
-            # Nearest point above
-            _, idx_top = tree_above.query([x, y])
-            y_top = v_above.iloc[idx_top]['y']
-            v_top = v_above.iloc[idx_top]['velocity']
+        coords = vel_df[['x', 'y']].values
+        mask_above = Path(polygon_above).contains_points(coords)
+        mask_below = Path(polygon_below).contains_points(coords)
 
-            # Nearest point below
-            _, idx_bot = tree_below.query([x, y])
-            y_bot = v_below.iloc[idx_bot]['y']
-            v_bot = v_below.iloc[idx_bot]['velocity']
+        v_above = vel_df[mask_above]
+        v_below = vel_df[mask_below]
 
-            # Linear interpolation
-            if y_top == y_bot:
-                V_interp[i, j] = v_top
-            else:
-                V_interp[i, j] = v_top + (y - y_top) / (y_bot - y_top) * (v_bot - v_top)
+        if v_above.empty or v_below.empty:
+            raise ValueError("No velocity points found in layers above or below.")
 
-    V_masked = ma.masked_invalid(V_interp)
+        v_avg = 0.5 * (v_above['velocity'].mean() + v_below['velocity'].mean())
+        V_interp[inside] = v_avg
+
+    V_masked = np.ma.array(V_interp, mask=~inside)
     return X, Y, V_masked
 
 def fill_nan_nearest(arr):
@@ -362,3 +336,35 @@ def fill_nan_nearest(arr):
 
     # Apply 3x3 window filter
     return generic_filter(arr, nan_helper, size=3, mode='nearest')
+
+########################################
+#### used by interporlate-3D.ipynb #####
+########################################
+
+def extrapolate_bottom_constant(vp, z):
+    """
+    Fill NaNs in the bottom and top layers of vp (z, lat, lon) using the last valid value above
+    and the first valid value below, respectively.
+    """
+    vp_filled = vp.copy()
+    nz, ny, nx = vp.shape
+
+    for j in range(ny):
+        for i in range(nx):
+            col = vp[:, j, i]
+            valid = np.isfinite(col)
+            if np.any(valid):
+                # Fill bottom layers
+                last_idx = np.where(valid)[0].max()
+                last_val = col[last_idx]
+                col[last_idx+1:] = last_val
+                
+                # Fill top layers
+                first_idx = np.where(valid)[0].min()
+                first_val = col[first_idx]
+                col[:first_idx] = first_val
+
+                vp_filled[:, j, i] = col
+
+    return vp_filled
+
