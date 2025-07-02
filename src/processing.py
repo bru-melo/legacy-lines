@@ -341,30 +341,62 @@ def fill_nan_nearest(arr):
 #### used by interporlate-3D.ipynb #####
 ########################################
 
+# def extrapolate_bottom_constant(vp, z):
+#     """
+#     Fill NaNs in the bottom and top layers of vp (z, lat, lon) using the last valid value above
+#     and the first valid value below, respectively.
+#     """
+#     vp_filled = vp.copy()
+#     nz, ny, nx = vp.shape
+
+#     for j in range(ny):
+#         for i in range(nx):
+#             col = vp[:, j, i]
+#             valid = np.isfinite(col)
+#             if np.any(valid):
+#                 # Fill bottom layers
+#                 last_idx = np.where(valid)[0].max()
+#                 last_val = col[last_idx]
+#                 col[last_idx+1:] = last_val
+                
+#                 # Fill top layers
+#                 first_idx = np.where(valid)[0].min()
+#                 first_val = col[first_idx]
+#                 col[:first_idx] = first_val
+
+#                 vp_filled[:, j, i] = col
+
+#     return vp_filled
+
 def extrapolate_bottom_constant(vp, z):
     """
-    Fill NaNs in the bottom and top layers of vp (z, lat, lon) using the last valid value above
-    and the first valid value below, respectively.
+    Fill NaNs at the top and bottom of each (z, lat, lon) column in vp.
+    - Propagates the first valid value downward to fill top NaNs.
+    - Propagates the last valid value upward to fill bottom NaNs.
+    Internal NaNs (between valid values) are untouched.
     """
     vp_filled = vp.copy()
     nz, ny, nx = vp.shape
 
     for j in range(ny):
         for i in range(nx):
-            col = vp[:, j, i]
+            col = vp[:, j, i].copy()  # copy explicitly to avoid aliasing bugs
             valid = np.isfinite(col)
-            if np.any(valid):
-                # Fill bottom layers
-                last_idx = np.where(valid)[0].max()
-                last_val = col[last_idx]
-                col[last_idx+1:] = last_val
-                
-                # Fill top layers
-                first_idx = np.where(valid)[0].min()
-                first_val = col[first_idx]
-                col[:first_idx] = first_val
 
-                vp_filled[:, j, i] = col
+            if not np.any(valid):
+                continue  # skip fully-NaN columns
+
+            first_idx = np.flatnonzero(valid)[0]
+            last_idx = np.flatnonzero(valid)[-1]
+
+            # Fill top NaNs
+            if first_idx > 0:
+                col[:first_idx] = col[first_idx]
+
+            # Fill bottom NaNs
+            if last_idx < nz - 1:
+                col[last_idx+1:] = col[last_idx]
+
+            vp_filled[:, j, i] = col
 
     return vp_filled
-
